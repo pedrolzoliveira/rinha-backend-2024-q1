@@ -98,7 +98,7 @@ const CONTROLLERS = Object.freeze({
         descricao.length > 10 ||
         descricao.length < 1
       ) {
-        res.writeHead(400);
+        res.writeHead(422);
         res.end();
         return;
       }
