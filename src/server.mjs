@@ -195,3 +195,7 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(9999);
+
+process.on('SIGINT', () => {
+  server.close(() => process.exit(1));
+});
