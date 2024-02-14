@@ -2,7 +2,7 @@ version: "3.5"
 
 services:
   api01: &api
-    image: rinha-de-backend-2024-q1
+    image: pedrolzoliveira/rinha-de-backend-2024-q1
     hostname: api01
     environment:
       - PORT=3000
