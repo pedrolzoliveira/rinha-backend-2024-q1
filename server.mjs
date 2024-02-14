@@ -1,7 +1,7 @@
 import http from 'http';
 import pg from 'pg';
 
-const db = new pg.Client('postgres://postgres:1234@localhost/rinha');
+const db = new pg.Client(process.env.DB_STRING);
 
 await db.connect();
 
@@ -97,6 +97,7 @@ const CONTROLLERS = Object.freeze({
       if (
         error ||
         !Number.isInteger(valor) ||
+        valor < 0 ||
         (tipo !== 'c' && tipo !== 'd') ||
         typeof descricao !== 'string' ||
         descricao.length > 10 ||
@@ -198,7 +199,9 @@ const server = http.createServer((req, res) => {
   controllerHandler(req, res);
 });
 
-server.listen(9999);
+server.listen(process.env.PORT, () => {
+  console.log(`Worker ${process.pid}, listening on port: ${process.env.PORT}`);
+});
 
 process.on('SIGINT', () => {
   server.close(() => process.exit(1));
