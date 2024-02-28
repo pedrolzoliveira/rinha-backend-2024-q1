@@ -1,208 +1,198 @@
 import http from 'http';
+import fastJson from 'fast-json-stringify';
 import pg from 'pg';
 
-const db = new pg.Client(process.env.DB_STRING);
-
-await db.connect();
-
-/**
- * 
- * @param {http.IncomingMessage} req 
- * @param {(error: Error | null, data: any) => any} cb
- */
-function withBody(req, cb) {
-  let data = '';
-
-  req.on('data', (chunk) => { data += chunk.toString(); });
-  req.on('end', () => {
-    try {
-      const body = JSON.parse(data);
-      cb(null, body); 
-    } catch (error) {
-      cb(error, null);
-    }
-  });
-}
-
-const CONTROLLERS = Object.freeze({
-  /**
-   * @param {http.IncomingMessage & { params: Params }} req 
-   * @param {http.ServerResponse<http.IncomingMessage> & { req: http.IncomingMessage }} res 
-   */
-  'GET /clientes/(\\d+)/extrato': function(req, res) {
-    const [clienteId] = req.params.values;
-    if (!clienteId) {
-      res.writeHead(400);
-      res.end();
-      return;
-    }
-
-    db.query(`
-    WITH ultimas_transacoes AS (
-      SELECT valor, tipo, descricao, realizada_em
-      FROM transacoes
-      WHERE cliente_id = $1::int
-      ORDER BY realizada_em DESC
-      LIMIT 10
-    ),
-    saldo AS (
-      SELECT saldo AS total, NOW() AS data_extrato, limite
-      FROM clientes
-      WHERE id = $1::int
-    )
-    SELECT json_build_object(
-      'saldo', (SELECT row_to_json(s) FROM saldo s),
-      'ultimas_transacoes', (SELECT json_agg(u) FROM ultimas_transacoes u)
-    ) AS resultado;
-    `, [clienteId], (error, result) => {
-      if (error) {
-        res.writeHead(500);
-        res.end();
-        return;
-      }
-
-      const [{ resultado: { saldo, ultimas_transacoes } }] = result.rows;
-
-      if (!saldo) {
-        res.writeHead(404);
-        res.end();
-        return; 
-      }
-
-      const writableData = JSON.stringify({
-        saldo,
-        ultimas_transacoes: ultimas_transacoes ?? []
-      });
-
-      res.writeHead(200, { 'Content-Type': 'application/json' })
-      res.write(writableData);
-      res.end();
-      return;
-    });
-  },
-
-  /**
-   * @param {http.IncomingMessage & { params: Params }} req 
-   * @param {http.ServerResponse<http.IncomingMessage> & { req: http.IncomingMessage }} res 
-   */
-  'POST /clientes/(\\d+)/transacoes': function(req, res) {
-    const [clienteId] = req.params.values;
-    if (!clienteId) {
-      res.writeHead(400);
-      res.end();
-      return;
-    }
-
-    withBody(req, (error, { valor, tipo, descricao }) => {
-      if (
-        error ||
-        !Number.isInteger(valor) ||
-        valor < 0 ||
-        (tipo !== 'c' && tipo !== 'd') ||
-        typeof descricao !== 'string' ||
-        descricao.length > 10 ||
-        descricao.length < 1
-      ) {
-        res.writeHead(422);
-        res.end();
-        return;
-      }
-
-      db.query('SELECT cliente_saldo AS saldo, cliente_limite AS limite FROM create_transacao($1::int, $2::int, $3::tipo_transacao, $4::varchar(10));', [clienteId, valor, tipo, descricao], (error, result) => {
-        if (error) {
-          res.writeHead(DB_ERRORS_TO_HTTP[error.code] || 400);
-          res.end();
-          return;
-        }
-
-        const [data] = result.rows;
-
-        const writableData = JSON.stringify(data);
-
-        res.writeHead(200, { 'Content-Type': 'application/json' })
-        res.write(writableData);
-        res.end();
-        return;
-      });
-    });
-  }
+const pool = new pg.Pool({
+  connectionString: process.env.DATABASE_URL,
+  max: 20,
+  application_name: 'rinha-backend'
 });
 
-const CONTROLLERS_ROUTES = Object.freeze(Object.keys(CONTROLLERS));
+const stringifyExtratoResponse = fastJson({
+  type: 'object',
+  properties: {
+    saldo: {
+      type: 'object',
+      properties: {
+        total: { type: 'number' },
+        data_extrato: { type: 'string' },
+        limite: { type: 'number' }
+      },
+    },
+    ultimas_transacoes: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          valor: { type: 'number' },
+          tipo: { type: 'string' },
+          descricao: { type: 'string' },
+          realizada_em: { type: 'string' }
+        }
+      }
+    }
+  },
+  
+});
+
+const stringifyTransacaoResponse = fastJson({
+  type: 'object',
+  properties: {
+    limite: { type: 'number' },
+    saldo: { type: 'number' }
+  }
+});
 
 const DB_ERRORS_TO_HTTP = Object.freeze({
   '23514': 422,
-  '23503': 404
+  '23503': 404,
+  'P0001': 404
 });
 
-class Route {
-  /**
-   * 
-   * @param {string} method 
-   * @param {string} url 
-   */
-  constructor(method, url) {
-    this.method = method;
-    this.url = url;
-
-    /**
-     * @type {string | undefined}
-     */
-    this.routeString = CONTROLLERS_ROUTES.find(route => {
-      const regex = new RegExp(route);
-      return regex.test(`${this.method} ${this.url}`);
-    });
-  }
-}
-
-class Params {
-  /**
-   * @param {Route} route 
-   */
-  constructor(route) {
-    const urlSlices = route.url.split('/');
-    urlSlices.shift();
-
-    const routeSlices = route.routeString.split('/');
-    routeSlices.shift();
-
-    const paramRegex = new RegExp('\\(.+\\)');
-    const paramsIndexes = routeSlices.reduce((indexes, routeSlice, index) => {
-      if (paramRegex.test(routeSlice)) {
-        indexes.push(index);
-      }
-      return indexes;
-    }, [])
-
-    const values = [];
-
-    paramsIndexes.forEach(index => {
-      values.push(urlSlices[index]);
-    });
-
-    this.values = values;
-  }
-}
-
 const server = http.createServer((req, res) => {
-  const route = new Route(req.method, req.url);
-  const controllerHandler = CONTROLLERS[route.routeString];
+  pool.connect((err, db) => {
+    try {
+      if (err) {
+        throw err;
+      }
 
-  if (!controllerHandler) {
-    res.writeHead(404);
-    res.end();
-    return;
-  }
-
-  req.params = new Params(route);
-
-  controllerHandler(req, res);
+      switch (req.method) {
+        case "GET": {
+          const paths = req.url?.split('/').filter(Boolean);
+          if (!paths) {
+            res.writeHead(404).end();
+            return;
+          }
+  
+          if (paths[0] !== 'clientes' || paths[2] !== 'extrato') {
+            res.writeHead(404).end();
+            return;
+          }
+  
+          const clienteId = Number(paths[1]);
+  
+          if (!Number.isInteger(clienteId)) {
+            res.writeHead(422).end(); 
+            return;
+          }
+  
+          const query = `
+            WITH ultimas_transacoes AS (
+              SELECT valor, tipo, descricao, realizada_em
+              FROM transacoes
+              WHERE cliente_id = $1::int
+              ORDER BY realizada_em DESC
+              LIMIT 10
+            ),
+            saldo AS (
+              SELECT saldo AS total, NOW() AS data_extrato, limite
+              FROM clientes
+              WHERE id = $1::int
+            )
+            SELECT json_build_object(
+              'saldo', (SELECT row_to_json(s) FROM saldo s),
+              'ultimas_transacoes', (SELECT json_agg(u) FROM ultimas_transacoes u)
+            ) AS resultado;
+          `;
+  
+          db.query(query, [clienteId], (error, result) => {
+            if (error) {
+              res.writeHead(500).end();
+              return;
+            }
+  
+            const [{ resultado: { saldo, ultimas_transacoes } }] = result.rows;
+  
+            if (!saldo) {
+              res.writeHead(404).end();
+              return; 
+            }
+  
+            const writableData = stringifyExtratoResponse({
+              saldo,
+              ultimas_transacoes: ultimas_transacoes ?? []
+            });
+  
+            res.writeHead(200).end(writableData);
+            return;
+          });
+  
+          break;
+        }
+        case "POST": {
+          const paths = req.url?.split('/').filter(Boolean);
+          if (!paths) {
+            res.writeHead(404).end();
+            return;
+          }
+  
+          if (paths[0] !== 'clientes' || paths[2] !== 'transacoes') {
+            res.writeHead(404).end();
+            return;
+          }
+  
+          const clienteId = Number(paths[1]);
+  
+          if (!Number.isInteger(clienteId)) {
+            res.writeHead(422).end(); 
+            return;
+          }
+  
+          let data = '';
+          req.on('data', chunk => { data += chunk.toString(); });
+          req.on('end', () => {
+            try {
+              const { valor, tipo, descricao } =  JSON.parse(data);
+              if (
+                !Number.isInteger(valor) ||
+                valor < 0 ||
+                (tipo !== 'c' && tipo !== 'd') ||
+                typeof descricao !== 'string' ||
+                descricao.length > 10 ||
+                descricao.length < 1
+              ) {
+                res.writeHead(422).end();
+                return;
+              }
+  
+              const query = 'SELECT cliente_saldo AS saldo, cliente_limite AS limite FROM create_transacao($1::int, $2::int, $3::tipo_transacao, $4::varchar(10));';
+  
+              db.query(query, [clienteId, valor, tipo, descricao], (error, result) => {
+                if (error) {
+                  res.writeHead(DB_ERRORS_TO_HTTP[error.code] || 400).end();
+                  return;
+                }
+        
+                const [row] = result.rows;
+        
+                const writableData = stringifyTransacaoResponse(row);
+        
+                res.writeHead(200).end(writableData);
+                return;
+              });
+            } catch (error) {
+              res.writeHead(422).end();
+              return;
+            }
+          });
+  
+          break;
+        }
+        default: {
+          res.writeHead(404).end();
+          return;
+        }
+      }
+    } catch (error) {
+      console.error(error);
+      res.writeHead(500).end();
+      return;
+    } finally {
+      db.release();
+    }
+  })
 });
 
 server.listen(process.env.PORT, () => {
-  console.log(`Worker ${process.pid}, listening on port: ${process.env.PORT}`);
-});
-
-process.on('SIGINT', () => {
-  server.close(() => process.exit(1));
+  console.log(`listening on port: ${process.env.PORT}`);
 });
