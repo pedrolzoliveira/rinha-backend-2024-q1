@@ -184,7 +184,6 @@ const server = http.createServer((req, res) => {
         }
       }
     } catch (error) {
-      console.error(error);
       res.writeHead(500).end();
       return;
     } finally {
