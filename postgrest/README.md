@@ -5,3 +5,7 @@ The stack:
 `PostgREST` for the "server"
 `PostgreSQL` for the database
 `openresty (Nginx + Lua)` as the load balancer
+
+
+link do repositorio: https://github.com/pedrolzoliveira/rinha-backend-2024-q1
+twitter: https://twitter.com/PedrolzOliveira
